@@ -12,9 +12,15 @@
 ║   Parámetro de selección:                                            ║
 ║     strategy:=bangbang | pid | fuzzy                                 ║
 ║                                                                      ║
-║   Convención de motores (corregida):                                 ║
-║     M1 = motor IZQUIERDO  → herr > 0 (target a izq) → M1 sube      ║
-║     M2 = motor DERECHO    → herr < 0 (target a der) → M2 sube      ║
+║   Convención de motores:                                             ║
+║     M1 = motor IZQUIERDO  (Y-)  torque = (F1-F2)*ARM → si M1>M2 gira derecha ║
+║     M2 = motor DERECHO    (Y+)  torque = (F1-F2)*ARM → si M2>M1 gira izquierda ║
+║                                                                      ║
+║   NOTA FÍSICA DEL SIMULADOR:                                         ║
+║     ft = (f1+f2)/2  →  aceleración máxima ≈ MAX_THRUST/2 = 1.5 m/s²║
+║     torque = (F1-F2)*ARM_LENGTH  (F1=M1, F2=M2)                     ║
+║     herr>0 → target a IZQUIERDA → necesita girar izq → M2 sube      ║
+║       porque torque>0 (F2>F1) gira izquierda                        ║
 ║                                                                      ║
 ╚══════════════════════════════════════════════════════════════════════╝
 """
@@ -27,6 +33,18 @@ from geometry_msgs.msg import PointStamped
 from spaceship_msgs.msg import MotorCommand, ShipState
 
 _NO_TARGET = -999.0
+
+# ── Física del simulador (deben coincidir con ship_simulator.py) ──────
+MAX_THRUST   = 3.0   # N/kg por motor
+ARM_LENGTH   = 0.7
+LINEAR_DRAG  = 0.5
+ANGULAR_DRAG = 1.2
+INERTIA      = 1.5
+
+# Aceleración máxima de traslación (ambos motores al 100%)
+# ft = (f1+f2)/2 = MAX_THRUST  →  a_max = MAX_THRUST - v*LINEAR_DRAG
+# A velocidad baja: a_max ≈ MAX_THRUST = 3.0 m/s²
+A_MAX = MAX_THRUST  # 3.0 m/s²
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -45,36 +63,51 @@ def clamp(v, lo, hi):
     return max(lo, min(hi, v))
 
 
+def braking_distance(speed: float, margin: float = 1.2) -> float:
+    """
+    Distancia de frenado estimada con drag lineal.
+    Integración analítica aproximada de v²/(2*(A_MAX - drag*v)).
+    Para velocidades bajas el drag es pequeño → usa A_MAX.
+    Para velocidades altas el drag ayuda → distancia real menor.
+    Usamos conservadoramente A_MAX/2 (frenado efectivo real es menor
+    porque el drag frena también, pero así tenemos margen).
+    """
+    a_eff = max(A_MAX * 0.5, A_MAX - LINEAR_DRAG * speed)
+    return (speed * speed) / (2.0 * a_eff) * margin
+
+
 # ══════════════════════════════════════════════════════════════════════
 #  ESTRATEGIA 1: BANG-BANG CON CORRECCIÓN PROPORCIONAL
 # ══════════════════════════════════════════════════════════════════════
 
 class BangBangController:
     """
-    Máquina de estados clásica con corrección proporcional de heading
-    durante la fase de impulso.
-
-    Fases:
+    Máquina de estados:
         IDLE    → sin target
         ORIENT  → girar hasta apuntar al target
         THRUST  → impulsar corrigiendo heading en vuelo
         BRAKE   → orientar 180° y frenar
         FINE    → ajuste suave final
 
-    Convención diferencial:
-        herr > 0 → target a la izquierda → M1 sube, M2 baja
-        herr < 0 → target a la derecha   → M2 sube, M1 baja
+    Convención de giro (según simulador):
+        torque = (F1 - F2) * ARM_LENGTH
+        F1 > F2 → torque > 0 → gira DERECHA (heading decrece)
+        F2 > F1 → torque < 0 → gira IZQUIERDA (heading aumenta)
+
+        herr > 0 → target a la IZQUIERDA → queremos girar izq → M2 sube (F2 > F1)
+        herr < 0 → target a la DERECHA   → queremos girar der → M1 sube (F1 > F2)
     """
 
-    # ── Parámetros ────────────────────────────────────────────────────
-    ANGLE_TOL      = 0.12   # rad — tolerancia de orientación (~7°)
-    BRAKE_DISTANCE = 8.0    # m — distancia de inicio de frenado
-    FINE_DISTANCE  = 2.5    # m — zona de ajuste fino
-    POWER_MAX      = 80     # % — potencia máxima
+    ANGLE_TOL      = 0.10   # rad — tolerancia de orientación (~6°)
+    BRAKE_TOL      = 0.20   # rad — tolerancia alineación en frenado (más laxa)
+    POWER_MAX      = 80     # % — potencia máxima de empuje
     POWER_BRAKE    = 80     # % — potencia de frenado
-    POWER_FINE     = 30     # % — potencia en ajuste fino
-    POWER_TURN     = 70     # % — potencia de giro
-    KP_HEADING     = 50.0   # ganancia proporcional heading en vuelo
+    POWER_FINE     = 25     # % — potencia en ajuste fino
+    POWER_TURN     = 60     # % — potencia de giro puro
+    KP_HEADING     = 40.0   # ganancia proporcional heading en vuelo
+    BRAKE_MARGIN   = 1.3    # factor de seguridad distancia frenado
+    FINE_DISTANCE  = 2.0    # m — umbral zona fina (= ARRIVAL_DIST del sim)
+    FINE_SPEED     = 0.5    # m/s — velocidad máxima aceptable en zona fina
 
     def __init__(self):
         self.phase = 'IDLE'
@@ -83,7 +116,6 @@ class BangBangController:
         self.phase = 'ORIENT'
 
     def compute(self, s: ShipState, tx: float, ty: float) -> tuple[int, int]:
-        """Devuelve (power_m1, power_m2)."""
         dx    = tx - s.x
         dy    = ty - s.y
         dist  = math.sqrt(dx**2 + dy**2)
@@ -91,68 +123,89 @@ class BangBangController:
         herr  = angle_diff(angle, s.heading)
         speed = math.sqrt(s.vx**2 + s.vy**2)
 
-        # Frenado predictivo
-        d_stop = (speed**2) / (2.0 * 1.5) * 1.3
+        # Velocidad radial hacia el target (positiva = acercándose)
+        vr = (s.vx * dx + s.vy * dy) / max(dist, 0.1)
+
+        # Distancia de frenado necesaria (solo si nos acercamos)
+        d_stop = braking_distance(max(vr, 0.0), self.BRAKE_MARGIN)
 
         if self.phase == 'ORIENT':
             if abs(herr) < self.ANGLE_TOL:
                 self.phase = 'THRUST'
                 return self.POWER_MAX, self.POWER_MAX
-            # herr > 0 → girar izquierda → M1 sube
-            if herr > 0:
-                return self.POWER_TURN, 0
-            else:
-                return 0, self.POWER_TURN
+            return self._turn(herr)
 
         elif self.phase == 'THRUST':
-            if dist < self.BRAKE_DISTANCE or dist <= d_stop:
+            # Entrar en frenado si la distancia de parada supera la distancia al target
+            if dist < self.FINE_DISTANCE:
+                self.phase = 'FINE'
+                return 0, 0
+            if vr > 0.1 and d_stop >= dist:
                 self.phase = 'BRAKE'
                 return 0, 0
-            # Corrección proporcional: corr > 0 → herr > 0 → M1 sube, M2 baja
+            # Corrección proporcional de heading durante empuje
             corr = clamp(herr * self.KP_HEADING, -self.POWER_MAX, self.POWER_MAX)
-            m1 = clamp(self.POWER_MAX + corr, 0, self.POWER_MAX)
-            m2 = clamp(self.POWER_MAX - corr, 0, self.POWER_MAX)
+            # herr>0 → izquierda → M2 sube
+            m1 = clamp(self.POWER_MAX - corr, 0, self.POWER_MAX)
+            m2 = clamp(self.POWER_MAX + corr, 0, self.POWER_MAX)
             return int(m1), int(m2)
 
         elif self.phase == 'BRAKE':
             if dist < self.FINE_DISTANCE:
                 self.phase = 'FINE'
                 return 0, 0
-            # Orientar 180° (apuntar hacia atrás para frenar)
+            # Ya no nos acercamos o velocidad baja → pasar a FINE
+            if vr < 0.2 and speed < self.FINE_SPEED:
+                self.phase = 'FINE'
+                return 0, 0
+            # Orientar 180° (apuntar hacia atrás respecto al target)
             brake_angle = math.atan2(-dy, -dx)
             berr = angle_diff(brake_angle, s.heading)
-            if abs(berr) < self.ANGLE_TOL:
+            if abs(berr) < self.BRAKE_TOL:
+                # Alineado: frenar simétricamente
                 return self.POWER_BRAKE, self.POWER_BRAKE
-            if berr > 0:
-                return self.POWER_TURN, 0
-            else:
-                return 0, self.POWER_TURN
+            return self._turn(berr)
 
         elif self.phase == 'FINE':
-            if speed < 0.05 and dist < 2.0:
+            # Condición de llegada
+            if speed < 0.08 and dist < self.FINE_DISTANCE:
                 return 0, 0
-            # Si aún va rápido: frenar activamente
-            if speed > 0.3:
-                brake_angle = math.atan2(-dy, -dx)
+
+            if speed > self.FINE_SPEED:
+                # Frenar activamente: apuntar contra la velocidad
+                vel_angle = math.atan2(s.vy, s.vx)
+                brake_angle = vel_angle + math.pi  # opuesto a la velocidad
                 berr = angle_diff(brake_angle, s.heading)
-                if abs(berr) < self.ANGLE_TOL * 2:
+                if abs(berr) < self.BRAKE_TOL * 1.5:
                     return self.POWER_FINE, self.POWER_FINE
-                if berr > 0:
-                    return int(self.POWER_FINE * 0.5), 0
-                else:
-                    return 0, int(self.POWER_FINE * 0.5)
-            # Reorientar al target y empujar suave
-            if abs(herr) > self.ANGLE_TOL * 1.5:
-                if herr > 0:
-                    return int(self.POWER_FINE * 0.6), 0
-                else:
-                    return 0, int(self.POWER_FINE * 0.6)
-            corr = clamp(herr * self.KP_HEADING * 0.5, -self.POWER_FINE, self.POWER_FINE)
-            m1 = clamp(self.POWER_FINE + corr, 0, self.POWER_FINE)
-            m2 = clamp(self.POWER_FINE - corr, 0, self.POWER_FINE)
-            return int(m1), int(m2)
+                return self._turn_fine(berr)
+
+            # Velocidad baja: reorientar y empujar suave hacia target
+            if dist > 0.5 and abs(herr) > self.ANGLE_TOL * 2:
+                return self._turn_fine(herr)
+            if dist > 0.5:
+                corr = clamp(herr * self.KP_HEADING * 0.3, -self.POWER_FINE, self.POWER_FINE)
+                m1 = clamp(self.POWER_FINE - corr, 0, self.POWER_FINE)
+                m2 = clamp(self.POWER_FINE + corr, 0, self.POWER_FINE)
+                return int(m1), int(m2)
+            return 0, 0
 
         return 0, 0   # IDLE o fallback
+
+    def _turn(self, herr: float) -> tuple[int, int]:
+        """Giro puro. herr>0 → izquierda → M2 sube."""
+        if herr > 0:
+            return 0, self.POWER_TURN
+        else:
+            return self.POWER_TURN, 0
+
+    def _turn_fine(self, herr: float) -> tuple[int, int]:
+        """Giro suave en zona fina."""
+        p = int(self.POWER_TURN * 0.5)
+        if herr > 0:
+            return 0, p
+        else:
+            return p, 0
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -163,40 +216,28 @@ class PIDController:
     """
     Controlador PID dual:
         · PID de heading   → diferencial de motores (giro)
-        · PID de velocidad → potencia base (propulsión)
+        · Velocidad base   → potencia proporcional a distancia
 
-    Frenado predictivo:
-        d_stop = v² / (2 * a_decel_estimate)
-        Cuando dist ≤ d_stop, se invierte el heading y se frena.
+    Frenado predictivo basado en distancia de parada real.
 
-    Anti-windup:
-        El integrador se satura a ±integral_limit para evitar
-        acumulación en saturación.
-
-    Convención diferencial:
-        output > 0 → herr > 0 → target izq → M1 sube, M2 baja
-        output < 0 → herr < 0 → target der → M2 sube, M1 baja
+    Convención:
+        herr > 0 → target izquierda → M2 sube (output positivo → M2 sube)
     """
 
     # ── Parámetros PID heading ────────────────────────────────────────
-    KP_H    = 70.0
-    KI_H    = 2.0
-    KD_H    = 8.0
-    I_LIM_H = 40.0
+    KP_H    = 60.0
+    KI_H    = 1.5
+    KD_H    = 10.0
+    I_LIM_H = 30.0
 
-    # ── Parámetros PID velocidad ──────────────────────────────────────
-    KP_V    = 18.0
-    KI_V    = 0.5
-    KD_V    = 3.0
-    I_LIM_V = 30.0
-
-    # ── Parámetros de frenado predictivo ─────────────────────────────
-    A_DECEL_EST  = 1.5    # aceleración de frenado estimada (m/s²)
-    BRAKE_MARGIN = 1.5    # factor de seguridad
-    FINE_DIST    = 2.5    # m — zona de aproximación final
-    POWER_BASE   = 75     # % — potencia de crucero
-    POWER_FINE   = 25     # % — potencia en zona fina
-    ANGLE_TOL    = 0.10   # rad
+    # ── Parámetros de maniobra ────────────────────────────────────────
+    BRAKE_MARGIN  = 1.25   # factor de seguridad distancia frenado
+    FINE_DIST     = 2.0    # m — zona de aproximación final
+    POWER_BASE    = 70     # % — potencia de crucero
+    POWER_BRAKE   = 85     # % — potencia de frenado
+    POWER_FINE    = 22     # % — potencia en zona fina
+    ANGLE_TOL     = 0.10   # rad
+    BRAKE_TOL     = 0.20   # rad
 
     def __init__(self):
         self._reset_pid()
@@ -204,9 +245,7 @@ class PIDController:
 
     def _reset_pid(self):
         self.int_h  = 0.0
-        self.int_v  = 0.0
         self.prev_h = 0.0
-        self.prev_v = 0.0
 
     def reset(self):
         self.phase = 'ORIENT'
@@ -220,8 +259,9 @@ class PIDController:
         angle = math.atan2(dy, dx)
         herr  = angle_diff(angle, s.heading)
         speed = math.sqrt(s.vx**2 + s.vy**2)
+        vr    = (s.vx * dx + s.vy * dy) / max(dist, 0.1)
 
-        d_stop = (speed**2) / (2 * self.A_DECEL_EST) * self.BRAKE_MARGIN
+        d_stop = braking_distance(max(vr, 0.0), self.BRAKE_MARGIN)
 
         if self.phase == 'ORIENT':
             if abs(herr) < self.ANGLE_TOL:
@@ -231,28 +271,43 @@ class PIDController:
 
         elif self.phase == 'THRUST':
             if dist < self.FINE_DIST:
-                self.phase = 'FINE';  self._reset_pid();  return 0, 0
-            if dist <= d_stop:
-                self.phase = 'BRAKE'; self._reset_pid();  return 0, 0
+                self.phase = 'FINE'
+                self._reset_pid()
+                return 0, 0
+            if vr > 0.1 and d_stop >= dist:
+                self.phase = 'BRAKE'
+                self._reset_pid()
+                return 0, 0
             return self._pid_thrust(herr, dt, self.POWER_BASE)
 
         elif self.phase == 'BRAKE':
-            if dist < self.FINE_DIST or speed < 0.3:
-                self.phase = 'FINE';  self._reset_pid();  return 0, 0
-            brake_angle = math.atan2(-dy, -dx)
+            if dist < self.FINE_DIST:
+                self.phase = 'FINE'
+                self._reset_pid()
+                return 0, 0
+            if vr < 0.2 and speed < 0.5:
+                self.phase = 'FINE'
+                self._reset_pid()
+                return 0, 0
+            # Orientar contra la velocidad actual (más fiable que -target)
+            vel_angle   = math.atan2(s.vy, s.vx)
+            brake_angle = vel_angle + math.pi
             berr = angle_diff(brake_angle, s.heading)
-            if abs(berr) < self.ANGLE_TOL * 1.5:
-                return self._pid_thrust(berr, dt, 90)
+            if abs(berr) < self.BRAKE_TOL:
+                # Frenado simétrico: potencia fija sin corrección diferencial
+                p = self.POWER_BRAKE
+                return p, p
             return self._pid_turn(berr, dt)
 
         elif self.phase == 'FINE':
-            if speed < 0.05 and dist < 2.0:
+            if speed < 0.08 and dist < self.FINE_DIST:
                 return 0, 0
-            if speed > 0.3:
-                brake_angle = math.atan2(-dy, -dx)
+            if speed > 0.4:
+                vel_angle   = math.atan2(s.vy, s.vx)
+                brake_angle = vel_angle + math.pi
                 berr = angle_diff(brake_angle, s.heading)
-                if abs(berr) < self.ANGLE_TOL * 2:
-                    return self._pid_thrust(berr, dt, self.POWER_FINE)
+                if abs(berr) < self.BRAKE_TOL * 1.5:
+                    return self.POWER_FINE, self.POWER_FINE
                 return self._pid_turn(berr, dt)
             return self._pid_thrust(herr, dt, self.POWER_FINE)
 
@@ -261,8 +316,7 @@ class PIDController:
     def _pid_turn(self, herr: float, dt: float) -> tuple[int, int]:
         """
         Giro puro diferencial (base = 0).
-        output > 0 → M1 sube, M2 baja (gira izquierda)
-        output < 0 → M2 sube, M1 baja (gira derecha)
+        output > 0 → herr > 0 → target izquierda → M2 sube
         """
         self.int_h = clamp(self.int_h + herr * dt, -self.I_LIM_H, self.I_LIM_H)
         deriv = (herr - self.prev_h) / max(dt, 1e-6)
@@ -271,15 +325,16 @@ class PIDController:
             self.KP_H * herr + self.KI_H * self.int_h + self.KD_H * deriv,
             -100, 100
         )
-        m1 = clamp( output, 0, 100)
-        m2 = clamp(-output, 0, 100)
+        # output > 0 → izquierda → M2 sube
+        m1 = clamp(-output, 0, 100)
+        m2 = clamp( output, 0, 100)
         return int(m1), int(m2)
 
     def _pid_thrust(self, herr: float, dt: float,
                     base_power: int) -> tuple[int, int]:
         """
         Avance con corrección PID de heading.
-        corr > 0 → herr > 0 → M1 sube, M2 baja
+        corr > 0 → herr > 0 → izquierda → M2 sube
         """
         self.int_h = clamp(self.int_h + herr * dt, -self.I_LIM_H, self.I_LIM_H)
         deriv = (herr - self.prev_h) / max(dt, 1e-6)
@@ -288,8 +343,8 @@ class PIDController:
             self.KP_H * herr + self.KI_H * self.int_h + self.KD_H * deriv,
             -base_power, base_power
         )
-        m1 = clamp(base_power + corr, 0, 100)
-        m2 = clamp(base_power - corr, 0, 100)
+        m1 = clamp(base_power - corr, 0, 100)
+        m2 = clamp(base_power + corr, 0, 100)
         return int(m1), int(m2)
 
 
@@ -307,13 +362,17 @@ class FuzzyController:
         · speed          (m/s):  SLOW, MEDIUM_S, FAST
 
     Salidas:
-        · differential   (-100..100): positivo → gira izquierda (M1 sube)
+        · differential   (-100..100): positivo → gira izquierda (M2 sube)
         · thrust         (0..100):    potencia base
 
-    Convención diferencial:
-        differential > 0 → M1 sube, M2 baja (gira izquierda)
-        differential < 0 → M2 sube, M1 baja (gira derecha)
+    Convención diferencial (según simulador):
+        torque = (F1-F2)*ARM  → F2>F1 gira izquierda
+        differential > 0 → M2 sube, M1 baja (gira izquierda)
+        differential < 0 → M1 sube, M2 baja (gira derecha)
+        herr > 0 → target izquierda → differential positivo
     """
+
+    BRAKE_MARGIN = 1.3
 
     def __init__(self):
         self.phase = 'IDLE'
@@ -366,6 +425,7 @@ class FuzzyController:
         angle = math.atan2(dy, dx)
         herr  = angle_diff(angle, s.heading)
         speed = math.sqrt(s.vx**2 + s.vy**2)
+        vr    = (s.vx * dx + s.vy * dy) / max(dist, 0.1)
 
         fh = self._fuzzify_heading(herr)
         fd = self._fuzzify_dist(dist)
@@ -374,31 +434,35 @@ class FuzzyController:
         alineado    = fh['ZERO'] + 0.5 * (fh['POSSMALL'] + fh['NEGSMALL'])
         no_alineado = fh['POSBIG'] + fh['NEGBIG']
 
-        # differential > 0 → gira izquierda → M1 sube
+        # differential > 0 → gira izquierda → M2 sube
+        # herr > 0 → target izquierda → differential positivo
         diff_rules: list[tuple[float, float]] = [
-            (fh['NEGBIG'],   -85.0),   # target derecha fuerte → M2 sube
+            (fh['NEGBIG'],   -85.0),   # target derecha fuerte → M1 sube
             (fh['NEGSMALL'], -30.0),   # target derecha suave
             (fh['ZERO'],       0.0),   # recto
-            (fh['POSSMALL'],  30.0),   # target izquierda suave → M1 sube
+            (fh['POSSMALL'],  30.0),   # target izquierda suave → M2 sube
             (fh['POSBIG'],    85.0),   # target izquierda fuerte
         ]
 
-        # Velocidad de acercamiento al target
-        vr = (s.vx * dx + s.vy * dy) / max(dist, 0.1)
-        d_stop = (speed**2) / (2.0 * 1.5) * 1.4
-        need_brake = clamp((d_stop - dist) / max(d_stop, 0.1), 0, 1) if vr > 0.5 else 0.0
+        # Distancia de frenado necesaria
+        d_stop = braking_distance(max(vr, 0.0), self.BRAKE_MARGIN)
+        # need_brake: 1 cuando d_stop ≥ dist y nos acercamos
+        if vr > 0.2 and dist > 0:
+            need_brake = clamp((d_stop - dist) / max(dist * 0.5, 1.0), 0, 1)
+        else:
+            need_brake = 0.0
 
         thrust_rules: list[tuple[float, float]] = [
             (min(fd['FAR'],    fs['SLOW'],     alineado),    75.0),
-            (min(fd['FAR'],    fs['MEDIUM_S'], alineado),    60.0),
-            (min(fd['FAR'],    fs['FAST'],     alineado),    40.0),
-            (min(fd['MEDIUM'], fs['SLOW'],     alineado),    55.0),
-            (min(fd['MEDIUM'], fs['MEDIUM_S'], alineado),    30.0),
-            (min(fd['MEDIUM'], fs['FAST'],               1), 10.0),
-            (min(fd['CLOSE'],  fs['FAST'],               1),  0.0),
-            (min(fd['CLOSE'],  fs['SLOW'],    alineado),      20.0),
-            (min(no_alineado,                            1),   8.0),
-            (need_brake,                                       0.0),
+            (min(fd['FAR'],    fs['MEDIUM_S'], alineado),    55.0),
+            (min(fd['FAR'],    fs['FAST'],     alineado),    35.0),
+            (min(fd['MEDIUM'], fs['SLOW'],     alineado),    50.0),
+            (min(fd['MEDIUM'], fs['MEDIUM_S'], alineado),    25.0),
+            (min(fd['MEDIUM'], fs['FAST'],                1), 8.0),
+            (min(fd['CLOSE'],  fs['FAST'],                1),  0.0),
+            (min(fd['CLOSE'],  fs['SLOW'],     alineado),      15.0),
+            (min(no_alineado,                             1),   5.0),
+            (need_brake,                                         0.0),
         ]
 
         def wm(rules):
@@ -409,17 +473,23 @@ class FuzzyController:
         differential = wm(diff_rules)
         thrust       = wm(thrust_rules)
 
-        # Frenado activo cuando need_brake alto
-        if need_brake > 0.5 and speed > 0.5:
-            brake_angle = math.atan2(-dy, -dx)
+        # Frenado activo: cuando need_brake es alto, ignorar reglas normales
+        # y orientar contra la velocidad actual
+        if need_brake > 0.5 and speed > 0.4:
+            vel_angle   = math.atan2(s.vy, s.vx)
+            brake_angle = vel_angle + math.pi  # opuesto a la velocidad
             berr = angle_diff(brake_angle, s.heading)
+            # Diferencial para girar hacia brake_angle
+            # berr > 0 → brake_angle está a izquierda → M2 sube → differential positivo
             differential = clamp(berr * 80.0, -100, 100)
             if abs(berr) < 0.25:
-                thrust = 60.0
+                thrust = 70.0  # frenar fuerte
+            else:
+                thrust = 0.0   # girar primero, sin empujar
 
-        # differential > 0 → M1 sube, M2 baja
-        m1 = clamp(thrust + differential, 0, 100)
-        m2 = clamp(thrust - differential, 0, 100)
+        # differential > 0 → M2 sube, M1 baja
+        m1 = clamp(thrust - differential, 0, 100)
+        m2 = clamp(thrust + differential, 0, 100)
         return int(m1), int(m2)
 
 
