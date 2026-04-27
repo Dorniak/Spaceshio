@@ -10,7 +10,7 @@ def generate_launch_description():
     args = [
         DeclareLaunchArgument('target_x',  default_value=_NO_TARGET),
         DeclareLaunchArgument('target_y',  default_value=_NO_TARGET),
-        DeclareLaunchArgument('strategy',  default_value='pid',
+        DeclareLaunchArgument('strategy',  default_value='fuzzy',
             description='bangbang | pid | fuzzy'),
     ]
     return LaunchDescription(args + [

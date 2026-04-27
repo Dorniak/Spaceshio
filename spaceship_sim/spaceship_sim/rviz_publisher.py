@@ -113,8 +113,8 @@ class RvizPublisher(Node):
         marks.markers.append(self._flame(s, now, motor=1))
         marks.markers.append(self._flame(s, now, motor=2))
         marks.markers.append(self._timer_text(s, now))
-        marks.markers.append(self._power_bar(s, now, motor=1))
-        marks.markers.append(self._power_bar(s, now, motor=2))
+        #marks.markers.append(self._power_bar(s, now, motor=1))
+        #marks.markers.append(self._power_bar(s, now, motor=2))
         marks.markers.append(self._trail(now))
 
         if self.target_x is not None:
@@ -126,32 +126,31 @@ class RvizPublisher(Node):
     # ── Marcadores ────────────────────────────────────────────────────
 
     def _ship_body(self, s: ShipState, now) -> Marker:
-        """Cuerpo de la nave: T invertida con TRIANGLE_LIST."""
+        """Cuerpo de la nave: T invertida con nariz apuntando a +X local."""
         m = Marker()
-        m.header       = _header(now)
-        m.ns, m.id     = 'ship', 0
-        m.type         = Marker.TRIANGLE_LIST
-        m.action       = Marker.ADD
+        m.header = _header(now)
+        m.ns, m.id = 'ship', 0
+        m.type = Marker.TRIANGLE_LIST
+        m.action = Marker.ADD
         m.pose.position = _point(s.x, s.y)
         m.pose.orientation = _quaternion_z(s.heading)
         m.scale.x = m.scale.y = m.scale.z = 1.0
 
-        # Color: cyan en vuelo, verde al llegar
         if s.arrived:
             m.color = _color(0.1, 1.0, 0.2)
         else:
             m.color = _color(0.0, 0.9, 1.0)
 
-        # Fuselaje (triángulo: nariz arriba en local Y+)
+        # Fuselaje — nariz en +X local
         fuselage = [
-            (0.0,   0.8),   # nariz
-            (-0.15, -0.2),  # base izq
-            ( 0.15, -0.2),  # base der
+            (0.8, 0.0),  # nariz
+            (-0.2, -0.15),  # base inf
+            (-0.2, 0.15),  # base sup
         ]
-        # Barra horizontal de la T (2 triángulos)
+        # Barra horizontal de la T (motores en ±Y local)
         t_bar = [
-            (-0.7, -0.1), ( 0.7, -0.1), (-0.7, -0.3),
-            ( 0.7, -0.1), ( 0.7, -0.3), (-0.7, -0.3),
+            (-0.1, -0.7), (-0.1, 0.7), (-0.3, -0.7),
+            (-0.1, 0.7), (-0.3, 0.7), (-0.3, -0.7),
         ]
         for px, py in fuselage + t_bar:
             m.points.append(_point(px, py))
@@ -161,18 +160,18 @@ class RvizPublisher(Node):
 
     def _flame(self, s: ShipState, now, motor: int) -> Marker:
         """
-        Llama del motor motor=1 (izq, naranja) o motor=2 (der, morado).
+        Llama del motor motor=1 (Y−, naranja) o motor=2 (Y+, morado).
         Escala proporcional a la potencia.
         Si potencia = 0, manda DELETE.
         """
         power = s.power_m1 if motor == 1 else s.power_m2
-        anchor_x = -0.7 if motor == 1 else 0.7  # posición en X local
+        anchor_y = -0.7 if motor == 1 else 0.7  # eje Y local (barra de la T)
 
         m = Marker()
-        m.header   = _header(now)
-        m.ns       = 'flames'
-        m.id       = motor
-        m.action   = Marker.ADD
+        m.header = _header(now)
+        m.ns = 'flames'
+        m.id = motor
+        m.action = Marker.ADD
 
         if power < 1.0:
             m.action = Marker.DELETE
@@ -181,20 +180,20 @@ class RvizPublisher(Node):
         flame_len = (power / 100.0) * 0.8  # 0 – 0.8 metros
 
         m.type = Marker.TRIANGLE_LIST
-        m.pose.position   = _point(s.x, s.y)
+        m.pose.position = _point(s.x, s.y)
         m.pose.orientation = _quaternion_z(s.heading)
         m.scale.x = m.scale.y = m.scale.z = 1.0
 
         if motor == 1:
-            m.color = _color(1.0, 0.55, 0.0, 0.85)   # naranja
+            m.color = _color(1.0, 0.55, 0.0, 0.85)  # naranja
         else:
-            m.color = _color(0.7, 0.2,  1.0, 0.85)   # morado
+            m.color = _color(0.7, 0.2, 1.0, 0.85)  # morado
 
-        # Triángulo: base en el motor, punta hacia atrás (−Y local)
+        # Triángulo: base en el motor, punta hacia −X local (cola de la nave)
         flame_pts = [
-            (anchor_x - 0.1, -0.25),
-            (anchor_x + 0.1, -0.25),
-            (anchor_x,       -0.25 - flame_len),
+            (-0.2, anchor_y - 0.1),
+            (-0.2, anchor_y + 0.1),
+            (-0.2 - flame_len, anchor_y),
         ]
         for px, py in flame_pts:
             m.points.append(_point(px, py))

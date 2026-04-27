@@ -42,8 +42,8 @@ def generate_launch_description():
         DeclareLaunchArgument('target_y',       default_value=_NO_TARGET),
         DeclareLaunchArgument('strategy',       default_value='pid',
             description='bangbang | pid | fuzzy'),
-        DeclareLaunchArgument('wind_seed',      default_value='42'),
-        DeclareLaunchArgument('wind_strength',  default_value='1.2'),
+        DeclareLaunchArgument('wind_seed',      default_value='0'),
+        DeclareLaunchArgument('wind_strength',  default_value='0.0'),
         DeclareLaunchArgument('wind_frequency', default_value='0.15'),
     ]
 

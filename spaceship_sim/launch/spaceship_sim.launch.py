@@ -86,4 +86,11 @@ def generate_launch_description():
         output='screen',
     )
 
-    return LaunchDescription(args + [simulator, rviz_pub, rviz])
+    tf = Node(
+        package='tf2_ros',
+        executable='static_transform_publisher',
+        name='world_broadcaster',
+        arguments=['0', '0', '0', '0', '0', '0', 'world', 'map']
+    )
+
+    return LaunchDescription(args + [simulator, rviz_pub, rviz, tf])

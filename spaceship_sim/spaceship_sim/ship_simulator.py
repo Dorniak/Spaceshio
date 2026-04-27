@@ -39,9 +39,9 @@ from spaceship_msgs.msg import MotorCommand, ShipState
 # ── Constantes físicas ────────────────────────────────────────────────
 MAX_THRUST    = 3.0
 ARM_LENGTH    = 0.7
-LINEAR_DRAG   = 0.6
-ANGULAR_DRAG  = 2.5
-INERTIA       = 0.8
+LINEAR_DRAG   = 0.5
+ANGULAR_DRAG  = 1.2
+INERTIA       = 1.5
 
 # ── Condiciones de llegada ────────────────────────────────────────────
 ARRIVAL_DIST  = 2.0
@@ -236,14 +236,14 @@ class ShipSimulator(Node):
         f1 = (self.power_m1 / 100.0) * MAX_THRUST
         f2 = (self.power_m2 / 100.0) * MAX_THRUST
 
-        # Propulsión en dirección heading
-        ft = f1 + f2
+        # Traslación: solo la componente común (promedio)
+        ft = (f1 + f2) / 2.0  # ← dividir entre 2, no sumar
         ax = ft * math.cos(self.heading) - self.vx * LINEAR_DRAG
         ay = ft * math.sin(self.heading) - self.vy * LINEAR_DRAG
 
-        # Torque diferencial (M2 gira izq +, M1 gira der -)
-        torque = (f2 - f1) * ARM_LENGTH
-        alpha  = torque / INERTIA - self.omega * ANGULAR_DRAG
+        # Rotación: diferencial puro
+        torque = (f1 - f2) * ARM_LENGTH   # M1 izq (Y−) → empuja → gira derecha ✓
+        alpha = torque / INERTIA - self.omega * ANGULAR_DRAG
 
         # Viento (solo activo desde el primer impulso)
         self._update_wind(dt)
