@@ -250,9 +250,10 @@ class PIDController:
 # ─────────────────────────────────────────────────────────────────────
 
 class FuzzyController:
-    BMARGIN = 1.3
+    # Ajustamos el margen de predicción para quitar propulsión antes
+    COASTING_MARGIN = 1.0 
 
-    def __init__(self): self.phase = 'IDLE'
+    def __init__(self): self.phase = 'RUN'
     def reset(self):    self.phase = 'RUN'
 
     @staticmethod
@@ -277,16 +278,16 @@ class FuzzyController:
 
     def _fd(self, d):
         return {
-            'C': self._trap(d, 0, 0, 3.0, 6.0),
-            'M': self._tri(d, 4.0, 7.0, 11.0),
-            'F': self._trap(d, 8.0, 13.0, 999, 999),
+            'C': self._trap(d, 0, 0, 1.5, 4.0),
+            'M': self._tri(d, 2.5, 6.0, 10.0),
+            'F': self._trap(d, 7.0, 12.0, 999, 999),
         }
 
     def _fs(self, sp):
         return {
-            'S': self._trap(sp, 0, 0, 0.6, 1.5),
-            'M': self._tri(sp, 1.0, 2.5, 4.5),
-            'F': self._trap(sp, 3.5, 6.0, 999, 999),
+            'S': self._trap(sp, 0, 0, 0.5, 1.2),
+            'M': self._tri(sp, 0.8, 2.0, 3.5),
+            'F': self._trap(sp, 2.5, 5.0, 999, 999),
         }
 
     @staticmethod
@@ -301,59 +302,40 @@ class FuzzyController:
         speed = math.sqrt(s.vx*s.vx + s.vy*s.vy)
         vr    = (s.vx*dx + s.vy*dy) / max(dist, 0.01)
 
-        # ── Entrada a HOVER ───────────────────────────────────────────
-        # Condiciones para entrar en HOVER (control posicional preciso):
-        #   1. Cerca y velocidad baja (condicion clasica)
-        #   2. Muy cerca, sin importar velocidad
-        #   3. La distancia de frenado ya alcanza la distancia al target:
-        #      hay que frenar YA o nos pasamos del target
-        #   4. Overshoot: pasamos el target y nos alejamos de el
-        need_b   = brake_dist(max(vr, 0), self.BMARGIN * 1.4)
-        overshot  = (dist < 6.0 and vr < -0.25)
-        must_brake = (vr > 0.2 and need_b >= dist * 0.85)
-        if (dist < 3.0 and speed < 1.5) or (dist < 1.5) or must_brake or overshot:
-            self.phase = 'HOVER'
+        # Distancia de coasting (inercia): calculamos donde parariamos si cortamos motores ahora
+        # asumiendo LINEAR_DRAG = 0.5 (como indica el inicio del fichero)
+        coasting_dist = max(vr, 0) / 0.5
 
-        if self.phase == 'HOVER':
-            return hover(s, tx, ty)
+        # Si la inercia nos lleva hasta el target o mas alla, cortamos empuje
+        cut_thrust = (coasting_dist * self.COASTING_MARGIN) >= dist
 
         # ── Lógica fuzzy ──────────────────────────────────────────────
         fh = self._fh(herr);  fd = self._fd(dist);  fs = self._fs(speed)
         ali = fh['ZE'] + 0.5*(fh['PS']+fh['NS'])
-        nali = fh['PB'] + fh['NB']
 
         diff = self._wm([
-            (fh['NB'], -85.0), (fh['NS'], -30.0), (fh['ZE'], 0.0),
-            (fh['PS'],  30.0), (fh['PB'],  85.0),
+            (fh['NB'], -85.0), (fh['NS'], -40.0), (fh['ZE'], 0.0),
+            (fh['PS'],  40.0), (fh['PB'],  85.0),
         ])
 
-        need_b = brake_dist(max(vr,0), self.BMARGIN)
-        nb = clamp((need_b - dist) / max(dist*0.3, 1.0), 0, 1) if vr > 0.2 else 0.0
-
-        thrust = self._wm([
-            (min(fd['F'], fs['S'], ali),  75.0),
-            (min(fd['F'], fs['M'], ali),  55.0),
-            (min(fd['F'], fs['F'], ali),  30.0),
-            (min(fd['M'], fs['S'], ali),  50.0),
-            (min(fd['M'], fs['M'], ali),  20.0),
-            (min(fd['M'], fs['F'],    1),  5.0),
-            (min(fd['C'], fs['F'],    1),  0.0),
-            (min(fd['C'], fs['S'], ali),  10.0),
-            (min(nali,              1),    3.0),
-            (nb,                           0.0),
-        ])
-
-        # Maniobra de frenado activo
-        if nb > 0.5 and speed > 0.5:
-            brake_hdg = math.atan2(-s.vy, -s.vx)
-            berr = adiff(brake_hdg, s.heading)
-            diff = clamp(berr * 80.0, -100, 100)
-            thrust = 70.0 if abs(berr) < 0.25 else 0.0
+        if cut_thrust or dist < 1.0:
+            thrust = 0.0
+            # Si estamos parados o casi parados y necesitamos acercarnos mas dentro del margen de 3m
+            if dist > 2.0 and speed < 0.2 and not cut_thrust:
+                thrust = 15.0 * ali
+        else:
+            thrust = self._wm([
+                (min(fd['F'], fs['S'], ali),  85.0),
+                (min(fd['F'], fs['M'], ali),  60.0),
+                (min(fd['F'], fs['F'], ali),  30.0),
+                (min(fd['M'], fs['S'], ali),  55.0),
+                (min(fd['M'], fs['M'], ali),  25.0),
+                (min(fd['M'], fs['F'], 1),    0.0),
+            ])
 
         m1 = int(clamp(thrust + diff, 0, 100))
         m2 = int(clamp(thrust - diff, 0, 100))
         return m1, m2
-
 
 # ─────────────────────────────────────────────────────────────────────
 # NODO ROS2
